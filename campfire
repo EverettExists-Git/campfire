@@ -1,0 +1,2007 @@
+#!/usr/bin/env python3
+"""campfire - chat with people on the same Wi-Fi, right from your terminal.
+
+  campfire join              join the global room (everyone on the network)
+  campfire join <room>       join a room someone has lit
+  campfire light <room>      light a new room for others to join
+  campfire list              see which fires are burning nearby
+  campfire --name Sam join   pick a display name (or set CAMPFIRE_NAME)
+  campfire --peer <address> join
+                             reach someone directly when Wi-Fi hides them
+  campfire version           show which version you have
+  campfire update            download and install the newest version
+  campfire rm                uninstall campfire from this Mac
+
+Inside a room, type to send a spark. Use @name to mention someone (they get a
+notification even if they've muted campfire). Type /help to see all commands.
+"""
+import base64
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+import uuid
+import zlib
+from collections import OrderedDict, namedtuple
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import readline  # keeps half-typed text intact when sparks arrive
+except ImportError:
+    readline = None
+
+VERSION = "0.9.4"
+REPO = "EverettExists-Git/campfire"  # where `campfire update` looks for new versions
+UPDATE_URLS = [f"https://raw.githubusercontent.com/{REPO}/{branch}/campfire"
+               for branch in ("main", "master")]
+
+
+def _env_port():
+    try:
+        return int(os.environ.get("CAMPFIRE_PORT") or 50505)
+    except ValueError:
+        return 50505
+
+
+PORT = _env_port()
+MCAST_GROUP = "239.255.50.5"  # a "local network only" multicast address
+PROTO = 2                     # 1 = campfire 0.7 and older
+TEXT_LIMIT = 400              # longest single spark; longer ones are split up
+MAX_SKEW = 300                # seconds a signed message may be off before it's treated as a replay
+FP_LEN = 20                   # hex characters of a fingerprint
+GLOBAL = "global"
+MY_ID = uuid.uuid4().hex[:8]  # changes every time you start campfire
+CONFIG_DIR = Path(os.environ.get("CAMPFIRE_HOME") or Path.home() / ".campfire")
+DOWNLOAD_DIR = Path.home() / "Downloads" / "campfire"
+
+ORANGE = "\033[38;5;208m"
+MAGENTA = "\033[38;5;177m"
+RED = "\033[38;5;203m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+# Bright, readable colors (256-color codes) for names
+PALETTE = [203, 209, 214, 185, 149, 114, 79, 80, 75, 111, 141, 177, 213, 175]
+
+HELP = [
+    ("/help", "show this list"),
+    ("/who", "see who's around the fire"),
+    ("/whisper <n> <message>", "send a message only <n> will see (also /w, /msg)"),
+    ("@<n>", "mention someone in a spark; they're notified even if muted"),
+    ("/send", "pick a file from a window and share it with the room"),
+    ("/send <n>", "pick a file and share it privately with <n>"),
+    ("/send <path> [name]", "or give the file's path (drag it in from Finder)"),
+    ("/files", "list files people are sharing right now"),
+    ("/get <number>", "download a shared file to ~/Downloads/campfire"),
+    ("/id [name]", "show a fingerprint, to check someone is who they say"),
+    ("/trust <n>", "accept <n>'s new identity once you've checked with them"),
+    ("/peer <address>", "reach someone directly if Wi-Fi is hiding them"),
+    ("/net", "show how campfire is reaching people"),
+    ("/version", "show which campfire version you're running"),
+    ("/mute", "turn off desktop notifications (@mentions still get through)"),
+    ("/unmute", "turn desktop notifications back on"),
+    ("/quit", "leave the fire (also /q, /leave)"),
+]
+
+
+# ---------- small helpers ----------
+
+def cname(name):
+    """Name in a color that's always the same for the same person."""
+    code = PALETTE[zlib.crc32(name.lower().encode()) % len(PALETTE)]
+    return f"\033[1;38;5;{code}m{name}{RESET}"
+
+
+def clean(text, limit=500):
+    """Strip control characters so nobody can mess with your terminal."""
+    return "".join(ch for ch in str(text) if ch.isprintable())[:limit]
+
+
+def stamp():
+    return datetime.now().strftime("%H:%M")
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def safe_filename(name):
+    """Only the bare file name, never a path, and never a hidden/dot file."""
+    base = clean(os.path.basename(str(name).replace("\\", "/")), 120).lstrip(".").strip()
+    return base or "file"
+
+
+def unique_path(directory, filename):
+    p = directory / filename
+    n = 1
+    while p.exists() or p.with_name(p.name + ".part").exists():
+        p = directory / f"{Path(filename).stem} ({n}){Path(filename).suffix}"
+        n += 1
+    return p
+
+
+def tilde(path):
+    s = str(path)
+    home = str(Path.home())
+    return "~" + s[len(home):] if s.startswith(home) else s
+
+
+def resolve_path(text):
+    """Be forgiving about how someone typed or dragged in a path."""
+    text = text.strip().strip("'\"")
+    if not text:
+        return None
+    home = Path.home()
+    cands = [os.path.expanduser(text)]
+    if text.startswith("~/") and text[2:].lower().startswith("users/"):
+        cands.append("/" + text[2:])  # "~/users/me/x" was meant as "/Users/me/x"
+    if "/" not in text:  # just a file name: look in the usual places
+        for d in (Path.cwd(), home / "Desktop", home / "Downloads", home / "Documents"):
+            cands.append(str(d / text))
+    for c in cands:
+        c = c.rstrip("/") or "/"
+        if os.path.exists(c):
+            return os.path.abspath(c)
+    return None
+
+
+def parse_send_args(rest):
+    """Work out what /send was asked to do. Returns (path, recipient, use_picker)."""
+    rest = rest.strip()
+    if not rest:
+        return None, None, True  # plain /send: open the file picker
+    p = resolve_path(rest)  # the whole thing is a path (handles unquoted spaces)
+    if p:
+        return p, None, False
+    try:
+        args = shlex.split(rest)
+    except ValueError:  # e.g. an unquoted apostrophe in the name
+        args = rest.split()
+    for k in range(len(args), 0, -1):
+        p = resolve_path(" ".join(args[:k]))
+        if p and len(args) - k <= 1:
+            return p, (args[k] if k < len(args) else None), False
+    if len(args) == 1:
+        return None, args[0], True  # probably "/send sam": pick a file for Sam
+    return None, None, False
+
+
+def pick_file():
+    """Open the standard macOS file window. Returns (path, message_if_none)."""
+    if sys.platform != "darwin":
+        return None, "The file window only works on a Mac. Use /send <path> instead."
+    script = ["tell current application", "activate",
+              'set f to choose file with prompt "Pick a file to share on campfire"',
+              "end tell", "POSIX path of f"]
+    cmd = ["osascript"]
+    for line in script:
+        cmd += ["-e", line]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None, "Couldn't open the file window."
+    if r.returncode != 0:
+        return None, "Cancelled." if "-128" in r.stderr else "Couldn't open the file window."
+    path = r.stdout.strip()
+    return (path, None) if path else (None, "Cancelled.")
+
+
+def as_command(line):
+    """If this line is a / command, return it; otherwise None.
+
+    Commands are for you alone: they run on your computer and are never sent to the room.
+    Invisible characters (zero-width spaces and the like) in front of the "/" are skipped on
+    purpose, so a command can't slip out as a message just because it didn't start with a
+    visible "/".
+    """
+    i = 0
+    while i < len(line) and unicodedata.category(line[i])[0] in "CZ":
+        i += 1
+    return line[i:] if line[i:i + 1] == "/" else None
+
+
+MENTION_RE = re.compile(r"(?<![\w@])@(\S+)")  # the lookbehind skips emails like a@b.com
+MAX_MENTIONS = 10
+_TRAILING_PUNCT = ".,;:!?)]}\"'…"
+
+
+def mention_candidates(token):
+    """'sam,' 'sam!' and "sam's" all point at 'sam'. Best guess first."""
+    out = [token]
+    trimmed = token.rstrip(_TRAILING_PUNCT)
+    for cand in (trimmed, re.sub(r"['’]s$", "", trimmed, flags=re.I)):
+        if cand and cand not in out:
+            out.append(cand)
+    return out
+
+
+def is_mentioned(men, ident, name):
+    """Does a spark's mention list include me?"""
+    if not isinstance(men, list):
+        return False
+    me = {f"sid:{MY_ID}", f"name:{name.lower()}"}
+    if ident:
+        me.add(f"fp:{ident.fp}")
+    return any(isinstance(x, str) and x in me for x in men[:MAX_MENTIONS * 2])
+
+
+def highlight_mention(text, name):
+    """Make my own @name stand out in a line of chat (text must already be cleaned)."""
+    pat = re.compile(r"(?<![\w@])@" + re.escape(name) + r"(?:#[0-9a-fA-F]{1,8})?(?!\w)", re.I)
+    return pat.sub(lambda m: f"\033[1;7m{m.group(0)}{RESET}", text)
+
+
+_last_notify = [0.0]
+
+
+def notify(title, text, sound="Pop", force=False):
+    """macOS desktop notification (rate-limited so a busy room isn't a nightmare)."""
+    if sys.platform != "darwin":
+        return
+    now = time.time()
+    if not force and now - _last_notify[0] < 2.0:
+        return
+    _last_notify[0] = now
+
+    def esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    script = (f'display notification "{esc(text[:200])}" '
+              f'with title "{esc(title)}" sound name "{sound}"')
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def say(text):
+    """Print a line without wrecking whatever the user is typing."""
+    buf = ""
+    # Mac's built-in readline (libedit) returns the LAST SENT line here instead of what's
+    # being typed, which made your own message show up again whenever someone else spoke.
+    if readline and "libedit" not in (readline.__doc__ or ""):
+        buf = readline.get_line_buffer()
+    sys.stdout.write("\r\033[K" + text + "\n> " + buf)
+    sys.stdout.flush()
+
+
+# ---------- self-update ----------
+
+class ProgressBar:
+    """A one-line progress bar. On a terminal it redraws in place; otherwise it prints each step."""
+
+    def __init__(self, out=None):
+        self.out = out or sys.stdout
+        self.tty = bool(getattr(self.out, "isatty", lambda: False)())
+        self.live = False  # is a bar sitting on the cursor's line right now?
+        self._last_label = None
+
+    def update(self, frac, label, extra=""):
+        frac = max(0.0, min(1.0, frac))
+        if not self.tty:
+            if label != self._last_label:
+                self.out.write(f"{label}...\n")
+                self.out.flush()
+            self._last_label = label
+            return
+        cols = shutil.get_terminal_size((80, 24)).columns
+        if cols < 80:
+            extra = ""  # no room for the extra details
+        width = max(8, min(30, cols - 25))
+        filled = int(frac * width)
+        bar = f"{ORANGE}{'█' * filled}{RESET}{DIM}{'░' * (width - filled)}{RESET}"
+        self.out.write(f"\r\033[K  {label:<11} {bar} {int(frac * 100):>3}%{DIM}{extra}{RESET}")
+        self.out.flush()
+        self.live = True
+
+    def close(self):
+        """Step off the bar's line, so a message or password prompt gets a clean one."""
+        if self.live:
+            self.out.write("\n")
+            self.out.flush()
+            self.live = False
+
+
+class UpdateError(Exception):
+    pass
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+PEEK_BYTES = 16384  # enough to see VERSION near the top without downloading the whole file
+
+
+def download_latest(on_progress=None, limit=None):
+    """Fetch the newest campfire source from GitHub.
+
+    on_progress(bytes_so_far, total_or_None) is called as the download goes. With limit set,
+    only the first `limit` bytes are read (used to peek at the version number).
+    """
+    last = "couldn't reach GitHub"
+    for n, url in enumerate(UPDATE_URLS):
+        req = urllib.request.Request(
+            f"{url}?cb={int(time.time())}",  # dodge GitHub's short-lived cache
+            headers={"User-Agent": f"campfire/{VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                if n and not limit:
+                    print(f"{DIM}(Couldn't find campfire on the '{UPDATE_URLS[0].split('/')[-2]}' "
+                          f"branch, so I checked '{url.split('/')[-2]}' instead.){RESET}")
+                try:
+                    total = int(r.headers.get("Content-Length") or 0) or None
+                except ValueError:
+                    total = None
+                data = bytearray()
+                while True:
+                    chunk = r.read(16384)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if limit and len(data) >= limit:
+                        break
+                    if len(data) > 2_000_000:
+                        raise UpdateError("The downloaded file is much bigger than expected, so I stopped.")
+                    if on_progress:
+                        on_progress(len(data), total)
+            # Tidy up files saved on Windows (CRLF line endings, a hidden BOM): either one
+            # would stop the installed copy from running as a command.
+            if limit:  # a cut-off copy may end mid-character; that's fine for peeking
+                return bytes(data[:limit]).decode("utf-8-sig", errors="ignore").replace("\r\n", "\n")
+            return bytes(data).decode("utf-8-sig").replace("\r\n", "\n")
+        except urllib.error.HTTPError as e:
+            last = f"GitHub said {e.code} for {url}"
+        except UnicodeDecodeError:
+            raise UpdateError("The downloaded file wasn't readable text, so I stopped.")
+        except OSError as e:
+            reason = str(getattr(e, "reason", e))
+            if "CERTIFICATE_VERIFY_FAILED" in reason:
+                raise UpdateError(
+                    "Your Python can't verify GitHub's security certificate. If you installed "
+                    "Python from python.org, open the Python folder in Applications and run "
+                    "'Install Certificates.command', then try again.")
+            raise UpdateError(f"Couldn't download the update ({reason}). Are you online?")
+    raise UpdateError(f"Couldn't find campfire in the repo ({last}).")
+
+
+def peek_latest():
+    """Learn the newest version without downloading everything.
+
+    Returns (version, full_text_or_None). The full text only comes back if the version number
+    wasn't near the top of the file and a complete download was needed to find it.
+    """
+    head = download_latest(limit=PEEK_BYTES)
+    m = re.search(r'^VERSION = "([0-9][0-9.]*)"', head, re.M)
+    if m:
+        return m.group(1), None
+    text = download_latest()
+    return validate_update(text), text
+
+
+def validate_update(text):
+    """Make sure the download really looks like campfire. Returns its version."""
+    m = re.search(r'^VERSION = "([0-9][0-9.]*)"', text, re.M)
+    if (not m or len(text) < 2000 or not text.startswith("#!/usr/bin/env python3")
+            or "def main" not in text):
+        raise UpdateError("The downloaded file doesn't look like campfire, so I didn't install it.")
+    try:
+        compile(text, "campfire-update", "exec")  # syntax check only, never runs it
+    except SyntaxError:
+        raise UpdateError("The downloaded file is broken, so I didn't install it.")
+    return m.group(1)
+
+
+def install_update(text, target, bar=None):
+    """Replace the installed copy. Asks for the Mac password if the folder is protected.
+
+    If a ProgressBar is given, it's moved along (up to 85%) as the install goes.
+    """
+    folder = os.path.dirname(target)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".campfire-update-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for i in range(0, len(text), 8192):
+                f.write(text[i:i + 8192])
+                if bar:
+                    bar.update(0.7 * min(1.0, (i + 8192) / len(text)), "Installing")
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, target)
+        if bar:
+            bar.update(0.85, "Installing")
+        return
+    except OSError:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    # The folder is protected (like /usr/local/bin): do it with sudo instead.
+    if bar:
+        bar.close()  # the password prompt needs a clean line
+    print("Your Mac needs your password to replace the installed copy (nothing shows as you type).")
+    stage = tempfile.mkdtemp(prefix="campfire-update-")
+    try:
+        staged = os.path.join(stage, "campfire")
+        with open(staged, "w", encoding="utf-8") as f:
+            f.write(text)
+        r = subprocess.run(["sudo", "install", "-m", "755", staged, target])
+        if r.returncode != 0:
+            raise UpdateError("The install didn't go through, so nothing was changed.")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    if bar:
+        bar.update(0.85, "Installing")
+
+
+def run_update(check_only=False, target=None):
+    target = target or os.path.realpath(__file__)
+    print(f"campfire v{VERSION}. Checking for updates...")
+    bar = ProgressBar()
+    try:
+        latest, text = peek_latest()
+        if version_tuple(latest) <= version_tuple(VERSION):
+            print(f"{ORANGE}🔥 You're up to date.{RESET}")
+            return
+        print(f"New version available: v{VERSION} → {BOLD}v{latest}{RESET}")
+        if check_only:
+            print("Type 'campfire update' to install it.")
+            return
+        if text is None:  # the progress bar starts here: only when there's something to install
+            try:
+                guess = os.path.getsize(target)  # stands in for the size if GitHub doesn't say
+            except OSError:
+                guess = 0
+
+            def on_progress(done, total):
+                size = total or max(done, guess, 1)
+                sizes = f"  {human_size(done)} / {human_size(total)}" if total else f"  {human_size(done)}"
+                bar.update(done / size, "Downloading", sizes)
+
+            text = download_latest(on_progress=on_progress)
+            bar.close()
+            latest = validate_update(text)
+            if version_tuple(latest) <= version_tuple(VERSION):
+                print(f"{ORANGE}🔥 You're up to date.{RESET}")
+                return
+        try:
+            answer = input("Install it? (y/n) ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer not in ("y", "yes"):
+            print("No changes made.")
+            return
+        bar.update(0.0, "Installing")
+        install_update(text, target, bar)
+    except UpdateError as e:
+        bar.close()
+        print(e)
+        return
+    finally:
+        bar.close()
+    bar = ProgressBar()
+    bar.update(0.85, "Checking")
+    r = subprocess.run([sys.executable, target, "version"], capture_output=True, text=True)
+    ok = latest in r.stdout
+    if ok:
+        bar.update(1.0, "Done")
+    bar.close()
+    if ok:
+        print(f"{ORANGE}✔ Updated!{RESET} You now have {BOLD}v{latest}{RESET}. Open campfire again to use it.")
+    else:
+        print("Installed, but I couldn't double-check it. Try 'campfire version'.")
+
+
+# ---------- uninstall ----------
+
+def run_remove(target=None, assume_yes=False):
+    target = target or os.path.realpath(__file__)
+    print("This will remove campfire from your Mac:")
+    print(f"  {target}")
+    if DOWNLOAD_DIR.exists():
+        print(f"{DIM}Files you downloaded with it (in {tilde(DOWNLOAD_DIR)}) will be kept.{RESET}")
+    if not assume_yes:
+        try:
+            answer = input("Remove it? (y/n) ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer not in ("y", "yes"):
+            print("No changes made.")
+            return
+    try:
+        os.remove(target)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        print("Your Mac needs your password to remove it (nothing shows as you type).")
+        r = subprocess.run(["sudo", "rm", "-f", target])
+        if r.returncode != 0:
+            print("That didn't go through, so nothing was changed.")
+            return
+    print(f"{ORANGE}🌙 campfire has been removed.{RESET} Thanks for stopping by the fire!")
+    print(f"{DIM}To get it back, install it again any time.{RESET}")
+
+
+# ---------- the big logo ----------
+
+_LETTERS = {
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "A": [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
+    "M": ["███╗   ███╗", "████╗ ████║", "██╔████╔██║", "██║╚██╔╝██║", "██║ ╚═╝ ██║", "╚═╝     ╚═╝"],
+    "P": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "],
+    "F": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "██║     ", "╚═╝     "],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "R": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
+    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
+}
+# top-to-bottom flame colors: yellow -> orange -> red
+_FLAME = [226, 220, 214, 208, 202, 196]
+
+
+def banner(color=True):
+    """The big CAMPFIRE logo, in fire colors. Falls back to one line on narrow windows."""
+    width = shutil.get_terminal_size((80, 24)).columns
+    if width < 64:
+        return f"{ORANGE}{BOLD}🔥 campfire{RESET} {DIM}v{VERSION}{RESET}\n"
+    rows = ["".join(_LETTERS[ch][r] for ch in "CAMPFIRE") for r in range(6)]
+    if color:
+        rows = [f"\033[1;38;5;{_FLAME[r]}m{row}{RESET}" for r, row in enumerate(rows)]
+    tagline = f"🔥 chat with everyone on your Wi-Fi  ·  v{VERSION}"
+    return "\n".join(rows) + "\n" + (f"{DIM}{tagline}{RESET}" if color else tagline) + "\n"
+
+
+def show_help():
+    print(f"{ORANGE}{BOLD}Campfire commands{RESET}")
+    for cmd, desc in HELP:
+        print(f"  {BOLD}{cmd.ljust(26)}{RESET} {desc}")
+    print(f"{DIM}Anything else you type is sent as a spark to the whole room.{RESET}")
+
+
+# ---------- built-in crypto (pure Python, no packages needed) ----------
+#
+# Ed25519 signatures (RFC 8032), X25519 (RFC 7748) and the XSalsa20-Poly1305
+# "box" that NaCl/libsodium use. It's wire-compatible with what PyNaCl produced,
+# so people running older copies of campfire can still talk to you securely.
+
+_P = 2 ** 255 - 19
+_Q = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_SQRT_M1 = pow(2, (_P - 1) // 4, _P)
+_M32 = 0xFFFFFFFF
+
+
+def _ed_add(a, b):
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    A = (y1 - x1) * (y2 - x2) % _P
+    B = (y1 + x1) * (y2 + x2) % _P
+    C = 2 * _D * t1 * t2 % _P
+    D = 2 * z1 * z2 % _P
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _P, G * H % _P, F * G % _P, E * H % _P)
+
+
+def _ed_mul(k, pt):
+    r = (0, 1, 1, 0)  # the neutral point
+    while k:
+        if k & 1:
+            r = _ed_add(r, pt)
+        pt = _ed_add(pt, pt)
+        k >>= 1
+    return r
+
+
+def _ed_pack(pt):
+    zi = pow(pt[2], _P - 2, _P)
+    x, y = pt[0] * zi % _P, pt[1] * zi % _P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_unpack(raw):
+    """Bytes -> curve point; raises ValueError if they aren't a valid point."""
+    if len(raw) != 32:
+        raise ValueError("bad point")
+    n = int.from_bytes(raw, "little")
+    y, sign = n & ((1 << 255) - 1), n >> 255
+    if y >= _P:
+        raise ValueError("bad point")
+    x2 = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P) % _P
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P:
+        x = x * _SQRT_M1 % _P
+    if (x * x - x2) % _P or (x == 0 and sign):
+        raise ValueError("bad point")
+    if x & 1 != sign:
+        x = _P - x
+    return (x, y, 1, x * y % _P)
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BASE = _ed_unpack(_BY.to_bytes(32, "little"))
+
+
+def _sha512_int(*parts):
+    return int.from_bytes(hashlib.sha512(b"".join(parts)).digest(), "little")
+
+
+def _ed_secret(seed):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def ed25519_public(seed):
+    return _ed_pack(_ed_mul(_ed_secret(seed)[0], _BASE))
+
+
+def ed25519_sign(seed, msg):
+    a, prefix = _ed_secret(seed)
+    pub = _ed_pack(_ed_mul(a, _BASE))
+    r = _sha512_int(prefix, msg) % _Q
+    R = _ed_pack(_ed_mul(r, _BASE))
+    k = _sha512_int(R, pub, msg) % _Q
+    return R + ((r + k * a) % _Q).to_bytes(32, "little")
+
+
+def _small_order(pt):
+    x, y, z, _ = _ed_mul(8, pt)
+    return x % _P == 0 and (y - z) % _P == 0
+
+
+def ed25519_verify(pub, msg, sig):
+    """Raises ValueError unless sig is a genuine signature of msg by pub."""
+    if len(sig) != 64 or len(pub) != 32:
+        raise ValueError("bad signature")
+    A = _ed_unpack(pub)
+    R = _ed_unpack(sig[:32])
+    S = int.from_bytes(sig[32:], "little")
+    if S >= _Q or _small_order(A) or _small_order(R):
+        raise ValueError("bad signature")
+    k = _sha512_int(sig[:32], pub, msg) % _Q
+    L = _ed_mul(S, _BASE)
+    Rt = _ed_add(R, _ed_mul(k, A))
+    if (L[0] * Rt[2] - Rt[0] * L[2]) % _P or (L[1] * Rt[2] - Rt[1] * L[2]) % _P:
+        raise ValueError("bad signature")
+
+
+def x25519(k, u):
+    """Curve25519 Diffie-Hellman: scalar k (32 bytes) times point u (32 bytes)."""
+    k = bytearray(k)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(k, "little")
+    u = int.from_bytes(u, "little") & ((1 << 255) - 1)
+    x1, x2, z2, x3, z3, swap = u, 1, 0, u, 1, 0
+    for t in range(254, -1, -1):
+        bit = (k >> t) & 1
+        if swap ^ bit:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        A, B = (x2 + z2) % _P, (x2 - z2) % _P
+        C, D = (x3 + z3) % _P, (x3 - z3) % _P
+        AA, BB = A * A % _P, B * B % _P
+        DA, CB = D * A % _P, C * B % _P
+        E = (AA - BB) % _P
+        x3 = (DA + CB) ** 2 % _P
+        z3 = x1 * (DA - CB) ** 2 % _P
+        x2 = AA * BB % _P
+        z2 = E * (AA + 121665 * E) % _P
+    if swap:
+        x2, x3, z2, z3 = x3, x2, z3, z2
+    out = x2 * pow(z2, _P - 2, _P) % _P
+    if out == 0:
+        raise ValueError("bad key")
+    return out.to_bytes(32, "little")
+
+
+def ed25519_pub_to_x25519(pub):
+    """The Curve25519 public key that goes with an Ed25519 public key."""
+    if _small_order(_ed_unpack(pub)):  # make sure it's a real, usable point
+        raise ValueError("bad key")
+    y = int.from_bytes(pub, "little") & ((1 << 255) - 1)
+    return ((1 + y) * pow(1 - y, _P - 2, _P) % _P).to_bytes(32, "little")
+
+
+def ed25519_seed_to_x25519(seed):
+    return hashlib.sha512(seed).digest()[:32]
+
+
+def _rotl(x, n):
+    return ((x << n) | (x >> (32 - n))) & _M32
+
+
+_SIGMA = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
+_QUADS = ((0, 4, 8, 12), (5, 9, 13, 1), (10, 14, 2, 6), (15, 3, 7, 11),
+          (0, 1, 2, 3), (5, 6, 7, 4), (10, 11, 8, 9), (15, 12, 13, 14))
+
+
+def _salsa_rounds(x):
+    for _ in range(10):
+        for quads in (_QUADS[:4], _QUADS[4:]):
+            for a, b, c, d in quads:
+                x[b] ^= _rotl((x[a] + x[d]) & _M32, 7)
+                x[c] ^= _rotl((x[b] + x[a]) & _M32, 9)
+                x[d] ^= _rotl((x[c] + x[b]) & _M32, 13)
+                x[a] ^= _rotl((x[d] + x[c]) & _M32, 18)
+    return x
+
+
+def _salsa20_block(key, nonce8, counter):
+    k = [int.from_bytes(key[i:i + 4], "little") for i in range(0, 32, 4)]
+    n = [int.from_bytes(nonce8[i:i + 4], "little") for i in range(0, 8, 4)]
+    st = [_SIGMA[0], k[0], k[1], k[2], k[3], _SIGMA[1], n[0], n[1],
+          counter & _M32, counter >> 32, _SIGMA[2], k[4], k[5], k[6], k[7], _SIGMA[3]]
+    x = _salsa_rounds(list(st))
+    return b"".join(((x[i] + st[i]) & _M32).to_bytes(4, "little") for i in range(16))
+
+
+def _hsalsa20(key, nonce16):
+    k = [int.from_bytes(key[i:i + 4], "little") for i in range(0, 32, 4)]
+    n = [int.from_bytes(nonce16[i:i + 4], "little") for i in range(0, 16, 4)]
+    x = _salsa_rounds([_SIGMA[0], k[0], k[1], k[2], k[3], _SIGMA[1], n[0], n[1],
+                       n[2], n[3], _SIGMA[2], k[4], k[5], k[6], k[7], _SIGMA[3]])
+    return b"".join(x[i].to_bytes(4, "little") for i in (0, 5, 10, 15, 6, 7, 8, 9))
+
+
+def _xsalsa20_stream(key, nonce24, length):
+    sub = _hsalsa20(key, nonce24[:16])
+    out = b"".join(_salsa20_block(sub, nonce24[16:], i) for i in range((length + 63) // 64))
+    return out[:length]
+
+
+def _poly1305(key, msg):
+    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    s = int.from_bytes(key[16:32], "little")
+    acc, p = 0, (1 << 130) - 5
+    for i in range(0, len(msg), 16):
+        block = msg[i:i + 16]
+        acc = (acc + int.from_bytes(block + b"\x01", "little")) * r % p
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def box_shared_key(my_x25519_secret, their_x25519_public):
+    return _hsalsa20(x25519(my_x25519_secret, their_x25519_public), bytes(16))
+
+
+def secretbox_seal(key, plaintext):
+    """nonce (24) + tag (16) + ciphertext, the same layout NaCl uses."""
+    nonce = os.urandom(24)
+    stream = _xsalsa20_stream(key, nonce, 32 + len(plaintext))
+    ct = bytes(a ^ b for a, b in zip(plaintext, stream[32:]))
+    return nonce + _poly1305(stream[:32], ct) + ct
+
+
+def secretbox_open(key, boxed):
+    if len(boxed) < 40:
+        raise ValueError("too short")
+    nonce, tag, ct = boxed[:24], boxed[24:40], boxed[40:]
+    stream = _xsalsa20_stream(key, nonce, 32 + len(ct))
+    if not hmac.compare_digest(tag, _poly1305(stream[:32], ct)):
+        raise ValueError("bad message")
+    return bytes(a ^ b for a, b in zip(ct, stream[32:]))
+
+
+# ---------- identity: who is really who ----------
+
+def b64e(raw):
+    return base64.b64encode(raw).decode("ascii")
+
+
+def b64d(text):
+    return base64.b64decode(text, validate=True)
+
+
+def fingerprint(pk):
+    return hashlib.sha256(pk).hexdigest()[:FP_LEN]
+
+
+def fmt_fp(fp):
+    return " ".join(fp[i:i + 4] for i in range(0, len(fp), 4))
+
+
+def canonical(msg):
+    """The exact bytes that get signed, so both sides agree what was said."""
+    return json.dumps(msg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+class Identity:
+    """Your long-term identity: a secret key kept in ~/.campfire/identity.key.
+
+    Everything you send is signed with it, so nobody can pretend to be you, and
+    whispers are encrypted so only the person you sent them to can read them.
+    """
+
+    def __init__(self, seed):
+        self._seed = seed
+        self.pk = ed25519_public(seed)
+        self.fp = fingerprint(self.pk)
+        self._box_secret = ed25519_seed_to_x25519(seed)
+        self._shared = {}  # their public key -> the key you two share
+
+    @classmethod
+    def load(cls, path=None):
+        path = path or CONFIG_DIR / "identity.key"
+        try:
+            seed = b64d(path.read_text().strip())
+            if len(seed) != 32:
+                raise ValueError("wrong length")
+        except (OSError, ValueError):
+            seed = os.urandom(32)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.chmod(path.parent, 0o700)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(b64e(seed) + "\n")
+            except OSError:
+                pass  # couldn't save it: you'll just have a new identity next time
+        return cls(seed)
+
+    def sign(self, data):
+        return ed25519_sign(self._seed, data)
+
+    def _key_with(self, their_pk):
+        key = self._shared.get(their_pk)
+        if key is None:
+            key = box_shared_key(self._box_secret, ed25519_pub_to_x25519(their_pk))
+            if len(self._shared) > 256:
+                self._shared.clear()
+            self._shared[their_pk] = key
+        return key
+
+    def encrypt_for(self, their_pk, plaintext):
+        return secretbox_seal(self._key_with(their_pk), plaintext)
+
+    def decrypt_from(self, their_pk, ciphertext):
+        return secretbox_open(self._key_with(their_pk), ciphertext)
+
+
+def verify_packet(m):
+    """Return the sender's public key if the packet's signature is genuine, else None."""
+    try:
+        pk = b64d(m["pk"])
+        sig = b64d(m["sig"])
+        body = {k: v for k, v in m.items() if k != "sig"}
+        ed25519_verify(pk, canonical(body), sig)
+        return pk
+    except Exception:
+        return None
+
+
+class Pins:
+    """Remembers which identity went with each name, so a change gets noticed."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = self._read()
+
+    def _read(self):
+        try:
+            d = json.loads(self.path.read_text())
+            return {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def get(self, name):
+        return self.data.get(name.lower())
+
+    def set(self, name, fp):
+        self.data = self._read()  # pick up changes from other campfire windows
+        self.data[name.lower()] = fp
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self.data, indent=1))
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+# ---------- finding your networks ----------
+
+def _mask_to_int(text):
+    if text.lower().startswith("0x"):
+        return int(text, 16)
+    return int.from_bytes(socket.inet_aton(text), "big")
+
+
+def _broadcast_for(ip, mask):
+    ip_i = int.from_bytes(socket.inet_aton(ip), "big")
+    return socket.inet_ntoa(((ip_i | (~mask & 0xFFFFFFFF)) & 0xFFFFFFFF).to_bytes(4, "big"))
+
+
+def _usable(ip, bcast):
+    return not (ip.startswith("127.") or ip.startswith("169.254.") or bcast == ip)
+
+
+def parse_ifconfig(text):
+    """Pull (interface, address, broadcast) out of `ifconfig` output (Mac and Linux)."""
+    found, cur = [], "?"
+    pat = re.compile(r"^\s+inet (\d+\.\d+\.\d+\.\d+) netmask (0x[0-9a-fA-F]+|\d+\.\d+\.\d+\.\d+)"
+                     r"(?: broadcast (\d+\.\d+\.\d+\.\d+))?")
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            cur = line.split()[0].rstrip(":")
+            continue
+        m = pat.match(line)
+        if m:
+            ip, mask, bcast = m.group(1), _mask_to_int(m.group(2)), m.group(3)
+            bcast = bcast or _broadcast_for(ip, mask)
+            if _usable(ip, bcast):
+                found.append((cur, ip, bcast))
+    return found
+
+
+def parse_ip_addr(text):
+    """Same thing from Linux's `ip -4 -o addr`."""
+    found = []
+    pat = re.compile(r"^\d+:\s+(\S+)\s+inet (\d+\.\d+\.\d+\.\d+)/(\d+)(?: brd (\d+\.\d+\.\d+\.\d+))?")
+    for line in text.splitlines():
+        m = pat.match(line)
+        if m:
+            ip, bits = m.group(2), int(m.group(3))
+            bcast = m.group(4) or _broadcast_for(ip, (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF)
+            if _usable(ip, bcast):
+                found.append((m.group(1), ip, bcast))
+    return found
+
+
+def local_interfaces():
+    """Every network this computer is on: [(interface, address, broadcast address or None)]."""
+    for cmd, parser in ((["/sbin/ifconfig"], parse_ifconfig), (["ifconfig"], parse_ifconfig),
+                        (["ip", "-4", "-o", "addr"], parse_ip_addr)):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        found = parser(r.stdout) if r.returncode == 0 else []
+        if found:
+            out = []
+            for item in found:
+                if item not in out:
+                    out.append(item)
+            return out
+    try:  # last resort: ask the OS which address it would use to get online
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("203.0.113.1", 9))  # nothing is actually sent
+            ip = s.getsockname()[0]
+        if not ip.startswith("127."):
+            return [("?", ip, None)]
+    except OSError:
+        pass
+    return []
+
+
+def parse_peer(text):
+    """'192.168.1.20', 'sams-mac.local' or '192.168.1.20:50505' -> (ip, port), or None."""
+    host, _, port = text.strip().partition(":")
+    try:
+        return socket.gethostbyname(host), (int(port) if port else PORT)
+    except (OSError, ValueError):
+        return None
+
+
+# ---------- chat networking ----------
+
+Sent = namedtuple("Sent", "mid data dests ok")
+
+
+def parse(data):
+    try:
+        m = json.loads(data.decode())
+        return m if isinstance(m, dict) else None
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+class Transport:
+    """Gets messages to people, and gets their messages to us.
+
+    Wi-Fi networks treat broadcast traffic badly, so every message goes out several
+    ways at once (each network's own broadcast address, multicast, and straight to
+    people we've already heard from). The first copy to arrive wins; the rest are
+    thrown away by the receiver.
+    """
+
+    def __init__(self, ident=None, peers=()):
+        self.ident = ident
+        self.peers = list(peers)       # people added by hand: [(ip, port)]
+        self.learned = lambda: []      # set by chat(): addresses of people we've heard from
+        self.ifaces = []
+        self.last_error = None
+        self.lock = threading.Lock()
+        self._joined = set()
+        self._checked = OrderedDict()  # packet hash -> verified key (or None), so copies are checked once
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)  # never leave the LAN
+        s.bind(("", PORT))
+        s.settimeout(0.5)
+        self.sock = s
+        self.refresh_interfaces()
+
+    def refresh_interfaces(self):
+        """Re-check which networks we're on (laptops move around). True if it changed."""
+        found = local_interfaces()
+        with self.lock:
+            changed = [(i[1], i[2]) for i in found] != [(i[1], i[2]) for i in self.ifaces]
+            self.ifaces = found
+            for ip in [i[1] for i in found] or ["0.0.0.0"]:
+                if ip in self._joined:
+                    continue
+                try:
+                    self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                         socket.inet_aton(MCAST_GROUP) + socket.inet_aton(ip))
+                    self._joined.add(ip)
+                except OSError:
+                    pass  # multicast isn't available here; the other routes still work
+        return changed
+
+    def _targets(self):
+        """Every way we try to reach people: [(address, multicast_interface_or_None)]."""
+        out = []
+        for _, ip, bcast in self.ifaces:
+            out.append(((bcast or "255.255.255.255", PORT), None))
+            out.append(((MCAST_GROUP, PORT), ip))
+        if not self.ifaces:
+            out += [(("255.255.255.255", PORT), None), ((MCAST_GROUP, PORT), None)]
+        for addr in list(self.learned()) + list(self.peers):
+            out.append((tuple(addr), None))
+        unique = []
+        for t in out:
+            if t not in unique:
+                unique.append(t)
+        return unique
+
+    def transmit(self, data, dests=None):
+        """Send raw bytes: to specific people, or every way we know. True if anything went out."""
+        targets = [(tuple(d), None) for d in dests] if dests else self._targets()
+        ok = False
+        with self.lock:
+            for addr, mcast_if in targets:
+                try:
+                    if mcast_if:
+                        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                             socket.inet_aton(mcast_if))
+                    self.sock.sendto(data, addr)
+                    ok = True
+                except OSError as e:
+                    self.last_error = str(e)
+        if ok:
+            self.last_error = None
+        return ok
+
+    def send(self, kind, room, name, text="", dest=None, to=None, mid=None, **extra):
+        """Build, sign and send a message. dest=(ip, port) sends to just that one person."""
+        msg = {"v": PROTO, "k": kind, "id": MY_ID, "room": room, "name": name, "text": text,
+               "mid": mid or secrets.token_hex(6), "ts": int(time.time())}
+        if to:
+            msg["to"] = to
+        msg.update(extra)
+        if self.ident:
+            msg["pk"] = b64e(self.ident.pk)
+            msg["sig"] = b64e(self.ident.sign(canonical(msg)))
+        data = json.dumps(msg).encode()
+        dests = [dest] if dest else None
+        return Sent(msg["mid"], data, dests, self.transmit(data, dests))
+
+    def recv(self):
+        """Next packet as (message, sender_address, verified_public_key_or_None), or None.
+
+        Raises OSError once the socket is closed. Packets with a bad signature are dropped.
+        """
+        try:
+            data, addr = self.sock.recvfrom(8192)
+        except socket.timeout:
+            return None
+        m = parse(data)
+        if not m:
+            return None
+        pk = None
+        if "sig" in m:
+            digest = hashlib.sha256(data).digest()
+            if digest in self._checked:
+                pk = self._checked[digest]
+            else:
+                pk = verify_packet(m)
+                self._checked[digest] = pk
+                while len(self._checked) > 1024:
+                    self._checked.popitem(last=False)
+            if pk is None:
+                return None  # forged or damaged
+        return m, addr, pk
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def open_transport(ident=None, peers=()):
+    try:
+        return Transport(ident, peers)
+    except OSError as e:
+        print(f"Couldn't open campfire's network port ({e}). Is another program using it?")
+        return None
+
+
+def find_fires(tp, seconds=3.0, room="*"):
+    """Ask who's lit a room and listen for answers. Returns {room: host_name}."""
+    fires = {}
+    start = time.time()
+    end, next_ask = start + seconds, start
+    while time.time() < end:
+        if time.time() >= next_ask:
+            tp.send("probe", room, "?")  # hosts answer right away instead of making us wait
+            next_ask += 1.0
+        try:
+            pkt = tp.recv()
+        except OSError:
+            break
+        if pkt is None:
+            continue
+        m = pkt[0]
+        if m.get("k") == "beacon" and m.get("id") != MY_ID:
+            fires[clean(m.get("room", "?"), 40)] = clean(m.get("name", "?"), 24)
+    return fires
+
+
+def chunk_text(text, limit=TEXT_LIMIT):
+    """Split a long message at spaces so every piece fits in one packet."""
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind(" ", 0, limit + 1)
+        if cut < limit // 2:
+            cut = limit
+        piece = text[:cut].strip()
+        if piece:
+            parts.append(piece)
+        text = text[cut:].strip()
+    if text:
+        parts.append(text)
+    return parts
+
+
+# ---------- who's around, and who they really are ----------
+
+class Roster:
+    """Everyone we've heard from lately, and whether they're who they claim to be."""
+
+    def __init__(self, name, ident, pins):
+        self.me = name
+        self.ident = ident
+        self.pins = pins
+        self.my_person = ident.fp if ident else MY_ID
+        self.lock = threading.RLock()
+        self.members = {}
+        self.secure_sids = set()  # sessions that have proven themselves with signatures
+        if pins and ident:
+            pins.set(name, ident.fp)  # this name is yours
+
+    @staticmethod
+    def person(mem):
+        return mem["fp"] or mem["sid"]
+
+    def touch(self, m, addr, pk):
+        sid = str(m.get("id", ""))
+        fp = fingerprint(pk) if pk else None
+        key = f"{fp}/{sid}" if pk else sid
+        try:
+            ver = int(m.get("v", 1))
+        except (TypeError, ValueError):
+            ver = 1
+        with self.lock:
+            mem = self.members.get(key)
+            if mem is None:
+                mem = self.members[key] = {"key": key, "sid": sid, "fp": fp, "pk": pk,
+                                           "changed": False, "warned": False}
+            mem.update(name=clean(m.get("name", "?"), 24) or "?", addr=addr,
+                       last=time.time(), ver=ver)
+            if pk:
+                self.secure_sids.add(sid)
+            self._check_pin(mem)
+            if len(self.members) > 200:
+                old = time.time() - 300
+                self.members = {k: v for k, v in self.members.items() if v["last"] > old}
+            return mem
+
+    def _check_pin(self, mem):
+        if not self.pins or not mem["fp"]:
+            return
+        pinned = self.pins.get(mem["name"])
+        if pinned is None:
+            self.pins.set(mem["name"], mem["fp"])  # first time we've met this name
+        mem["changed"] = pinned is not None and pinned != mem["fp"]
+
+    def take_warning(self, mem):
+        """A one-time warning if this name now belongs to a different identity."""
+        if mem["changed"] and not mem["warned"]:
+            mem["warned"] = True
+            return (f"{RED}⚠{RESET} {BOLD}{mem['name']}{RESET} is using a different identity from "
+                    f"the {mem['name']} you've talked to before. That could be a new computer, "
+                    f"or someone pretending. Check with them (try {BOLD}/id{RESET}), then type "
+                    f"{BOLD}/trust {self.label(mem)}{RESET} if it's really them.")
+        return None
+
+    def trust(self, mem):
+        with self.lock:
+            self.pins.set(mem["name"], mem["fp"])
+            for x in self.members.values():
+                self._check_pin(x)
+
+    def drop(self, m, pk):
+        sid = str(m.get("id", ""))
+        key = f"{fingerprint(pk)}/{sid}" if pk else sid
+        with self.lock:
+            return self.members.pop(key, None)
+
+    def by_key(self, key):
+        with self.lock:
+            return self.members.get(key)
+
+    def active(self):
+        now = time.time()
+        with self.lock:
+            return [x for x in self.members.values() if now - x["last"] < 12]
+
+    def unicast_addrs(self):
+        """Where to send things directly. Old campfires are left out: they'd show duplicates."""
+        return [x["addr"] for x in self.active() if x["ver"] >= 2]
+
+    def label(self, mem):
+        """Their name, plus #tag when somebody else is using the same name."""
+        same = mem["name"].lower()
+        clash = ((same == self.me.lower() and self.person(mem) != self.my_person)
+                 or any(x is not mem and x["name"].lower() == same
+                        and self.person(x) != self.person(mem) for x in self.active()))
+        return mem["name"] + (f"#{(mem['fp'] or mem['sid'])[:4]}" if clash else "")
+
+    def display(self, mem):
+        """Colored name, with a warning if their identity changed or they're unverified."""
+        s = cname(self.label(mem))
+        if mem["changed"]:
+            s = f"{RED}⚠{RESET}" + s
+        elif self.ident and not mem["pk"]:
+            s += f"{DIM}?{RESET}"
+        return s
+
+    def find(self, text):
+        """Look someone up by name. Returns (member, None) or (None, problem)."""
+        t = text.lstrip("@").lower()
+        act = self.active()
+        hits = [x for x in act if self.label(x).lower() == t] or [x for x in act if x["name"].lower() == t]
+        if not hits:
+            return None, "none"
+        if len({self.person(x) for x in hits}) > 1:
+            names = ", ".join(sorted({self.label(x) for x in hits}, key=str.lower))
+            return None, f"More than one person is using that name: {names}. Use the full name with the #tag."
+        return max(hits, key=lambda x: x["last"]), None
+
+    def mentions(self, text):
+        """Work out who the @names in a message point at.
+
+        Returns (targets, problems). Each target is an id the receiver can recognise as
+        themselves: 'fp:<fingerprint>' for someone verified, 'sid:<session>' for someone
+        who isn't, or 'name:<name>' if we haven't heard from that name yet. 'problems' are
+        messages about names that more than one person is using (those need the #tag).
+        """
+        targets, problems = [], []
+        for hit in MENTION_RE.finditer(text):
+            if not re.search(r"\w", hit.group(1)):
+                continue  # "@!!" isn't a name
+            cands = mention_candidates(hit.group(1))
+            target = None
+            for cand in cands:
+                mem, problem = self.find(cand)
+                if mem:
+                    target = f"fp:{mem['fp']}" if mem["fp"] else f"sid:{mem['sid']}"
+                    break
+                if problem != "none":
+                    problems.append(problem)
+                    target = ""  # more than one match: don't guess
+                    break
+            if target is None:
+                target = f"name:{cands[-1].lower()}"
+            if target and target not in targets and len(targets) < MAX_MENTIONS:
+                targets.append(target)
+        return targets, problems
+
+    def people(self):
+        """One entry per person (someone with two windows open counts once)."""
+        seen, out = set(), []
+        for x in sorted(self.active(), key=lambda x: x["name"].lower()):
+            p = (self.person(x), x["name"].lower())
+            if p not in seen:
+                seen.add(p)
+                out.append(x)
+        return out
+
+
+# ---------- file sharing (direct TCP) ----------
+
+class FileServer:
+    """Serves files you've offered. Starts only when you first use /send."""
+
+    def __init__(self):
+        self.shares = {}  # token -> {path, filename, size, to}
+        self.sock = None
+        self.port = None
+        self.stop = threading.Event()
+
+    def start(self):
+        if self.sock:
+            return
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", 0))
+        s.listen(5)
+        s.settimeout(0.5)
+        self.sock = s
+        self.port = s.getsockname()[1]
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            conn.settimeout(10)
+            line = b""
+            while not line.endswith(b"\n") and len(line) < 128:
+                ch = conn.recv(1)
+                if not ch:
+                    return
+                line += ch
+            parts = line.decode(errors="replace").split()
+            share = self.shares.get(parts[1]) if len(parts) == 2 and parts[0] == "GET" else None
+            if not share or not os.path.isfile(share["path"]):
+                conn.sendall(b"ERR\n")
+                return
+            with open(share["path"], "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                conn.sendall(f"OK {size}\n".encode())
+                conn.settimeout(30)
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    conn.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def close(self):
+        self.stop.set()
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+
+def announce(tp, roster, room, name, token, share, port):
+    """Tell the room (or just one person) about a file we're offering."""
+    dest, extra = None, {}
+    if share.get("to_key"):
+        mem = roster.by_key(share["to_key"])
+        if mem is None:
+            return  # they've left
+        dest, extra["tid"] = mem["addr"], mem["sid"]
+    tp.send("offer", room, name, share["filename"], dest=dest, to=share.get("to"),
+            size=share["size"], port=port, token=token, **extra)
+
+
+def fetch(offer, dest_dir):
+    """Download an offered file. Returns (saved_path, size). Raises OSError on failure."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with socket.create_connection((offer["ip"], offer["port"]), timeout=10) as s:
+        s.settimeout(30)
+        s.sendall(f"GET {offer['token']}\n".encode())
+        f = s.makefile("rb")
+        header = f.readline(128).decode(errors="replace").split()
+        if len(header) != 2 or header[0] != "OK" or not header[1].isdigit():
+            raise OSError("the sender no longer has this file")
+        size = int(header[1])
+        dest = unique_path(dest_dir, offer["filename"])
+        part = dest.with_name(dest.name + ".part")
+        try:
+            with open(part, "wb") as out:
+                remaining = size
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        raise OSError("the connection dropped before the file finished")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+            os.replace(part, dest)
+        except BaseException:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            raise
+    return dest, size
+
+
+def download_in_background(offer):
+    try:
+        dest, size = fetch(offer, DOWNLOAD_DIR)
+        say(f"{ORANGE}✔{RESET} Saved {BOLD}{tilde(dest)}{RESET} {DIM}({human_size(size)}){RESET}")
+    except OSError as e:
+        say(f"{DIM}Couldn't download {offer['filename']}: {e}. "
+            f"(The sender may have left, or a firewall may be in the way.){RESET}")
+
+
+# ---------- listening ----------
+
+def listen(tp, ident, room, name, host, roster, state, stop):
+    seen = OrderedDict()  # recent (sender, message id) pairs, to drop duplicate copies
+    while not stop.is_set():
+        try:
+            pkt = tp.recv()
+        except OSError:
+            break
+        if pkt is None:
+            continue
+        m, addr, pk = pkt
+        sid = str(m.get("id", ""))
+        kind = m.get("k")
+        if sid == MY_ID:
+            continue
+        if kind == "probe":  # someone's looking for fires
+            if host and m.get("room") in ("*", room):
+                tp.send("beacon", room, name, dest=addr)
+            continue
+        if m.get("room") != room:
+            continue
+        if pk is None and sid in roster.secure_sids:
+            continue  # this session has signed everything so far; unsigned means forged
+        if pk is not None:
+            ts = m.get("ts")
+            if not isinstance(ts, (int, float)) or abs(time.time() - ts) > MAX_SKEW:
+                continue  # too old or too new: probably a replay
+        mid = m.get("mid")
+        if mid:
+            key = (sid, str(mid))
+            if key in seen:  # a copy that came by another route
+                if kind == "whisper" and m.get("tid") == MY_ID:
+                    tp.send("ack", room, name, dest=addr, ref=str(mid))  # our ack may have been lost
+                continue
+            seen[key] = True
+            while len(seen) > 4096:
+                seen.popitem(last=False)
+
+        who = clean(m.get("name", "?"), 24)
+        muted = state["mute"]
+
+        if kind == "bye":
+            mem = roster.drop(m, pk)
+            state["offers"] = [o for o in state["offers"] if o["sender"] != (mem["key"] if mem else sid)]
+            say(f"{DIM}* {RESET}{roster.display(mem) if mem else cname(who)}{DIM} wandered off{RESET}")
+            continue
+
+        mem = roster.touch(m, addr, pk)
+        warning = roster.take_warning(mem)
+        if warning:
+            say(warning)
+        stamp_s = f"{DIM}{stamp()}{RESET}"
+
+        if kind == "spark":
+            text = clean(m.get("text", ""))
+            if is_mentioned(m.get("men"), ident, name):
+                # Being @mentioned gets through even if you've muted campfire.
+                say(f"{stamp_s} 🔔 {roster.display(mem)}: {highlight_mention(text, name)}")
+                notify(f"{roster.label(mem)} mentioned you in {room}", text, sound="Glass", force=True)
+            else:
+                say(f"{stamp_s} {roster.display(mem)}: {text}")
+                if not muted:
+                    notify(f"{roster.label(mem)} in {room}", text)
+        elif kind == "whisper":
+            tid = m.get("tid")
+            mine = (tid == MY_ID) if tid is not None else str(m.get("to", "")).lower() == name.lower()
+            if not mine:
+                continue
+            note = ""
+            if "ct" in m:  # encrypted: only readable by us, and only if it's really from them
+                if not (ident and pk):
+                    continue
+                try:
+                    text = clean(ident.decrypt_from(pk, b64d(m["ct"])).decode("utf-8"))
+                except Exception:
+                    continue
+                note = " 🔒"
+            else:
+                text = clean(m.get("text", ""))
+                if ident:
+                    note = f" {DIM}(not encrypted){RESET}"
+            say(f"{stamp_s} {MAGENTA}[whisper from{RESET} {roster.display(mem)}{MAGENTA}]{RESET}{note} {text}")
+            if mem["ver"] >= 2 and mid:
+                tp.send("ack", room, name, dest=addr, ref=str(mid))
+            if not muted:
+                notify(f"{roster.label(mem)} whispered to you", text, sound="Glass", force=True)
+        elif kind == "ack":
+            entry = state["pending"].get(m.get("ref"))
+            if entry and entry[1] == mem["key"]:
+                entry[0].set()
+        elif kind == "offer":
+            tid, to = m.get("tid"), m.get("to")
+            if tid is not None:
+                if tid != MY_ID:
+                    continue  # a private offer meant for someone else
+            elif to and str(to).lower() != name.lower():
+                continue
+            token = str(m.get("token", ""))
+            if not token or any(o["token"] == token for o in state["offers"]):
+                continue  # already know about this one (offers are re-announced)
+            try:
+                port = int(m["port"])
+                size = int(m["size"])
+            except (KeyError, ValueError, TypeError, OverflowError):
+                continue
+            if not (0 < port < 65536 and size >= 0):
+                continue
+            filename = safe_filename(m.get("text", ""))
+            n = state["next"]
+            state["next"] += 1
+            state["offers"] = (state["offers"] + [{
+                "n": n, "sender": mem["key"], "from": roster.label(mem), "filename": filename,
+                "size": size, "ip": addr[0], "port": port, "token": token,
+            }])[-20:]
+            how = "is sharing" if not (to or tid) else "is privately sharing"
+            say(f"{stamp_s} {ORANGE}📎{RESET} {roster.display(mem)} {how} {BOLD}{filename}{RESET} "
+                f"{DIM}({human_size(size)}){RESET}. Type {BOLD}/get {n}{RESET} to download it.")
+            if not muted:
+                notify(f"{roster.label(mem)} shared a file", f"{filename} ({human_size(size)})",
+                       sound="Glass", force=True)
+        elif kind == "hello":
+            say(f"{DIM}* {RESET}{roster.display(mem)}{DIM} sat down by the fire{RESET}")
+            tp.send("hb", room, name, dest=addr)  # so they see us right away
+        # "hb" (heartbeat) needs nothing more: touching the roster is the point
+
+
+def keepalive(tp, room, name, host, fserver, roster, stop):
+    tick, fails, warned = 0, 0, False
+    while not stop.is_set():
+        sent = tp.send("hb", room, name)
+        if host:
+            tp.send("beacon", room, name)
+        if sent.ok:
+            fails = 0
+            if warned:
+                warned = False
+                say(f"{DIM}The network is back.{RESET}")
+        else:
+            fails += 1
+            if fails >= 3 and not warned:
+                warned = True
+                say(f"{RED}⚠{RESET} {DIM}I can't send anything on the network right now ({tp.last_error}). "
+                    f"If your Mac asked about local network access, allow it for Terminal in "
+                    f"System Settings > Privacy & Security > Local Network.{RESET}")
+        if tick % 10 == 9 and tp.refresh_interfaces():
+            say(f"{DIM}Your network changed; reconnecting.{RESET}")
+        if tick % 5 == 0 and fserver.port:
+            # Re-announce shares every ~10s so people who joined late can see them.
+            for token, share in list(fserver.shares.items()):
+                announce(tp, roster, room, name, token, share, fserver.port)
+        tick += 1
+        stop.wait(2.0)
+
+
+# ---------- chat session ----------
+
+def chat(room, name, host=False, peers=()):
+    ident = Identity.load()
+    tp = open_transport(ident, peers)
+    if tp is None:
+        return
+
+    if host:
+        if room == GLOBAL:
+            print("The global fire is always burning. Just use: campfire join")
+            return tp.close()
+        print(f"Checking whether '{room}' is already lit...")
+        if room in find_fires(tp, 2.5, room):
+            print(f"'{room}' is already burning. Join it with: campfire join {room}")
+            return tp.close()
+    elif room != GLOBAL:
+        print(f"Looking for a fire called '{room}'...")
+        if room not in find_fires(tp, 3.0, room):
+            print(f"No fire found. Light it yourself with: campfire light {room}")
+            print("(Or check that you're on the same Wi-Fi as the person who lit it. "
+                  "If the Wi-Fi hides devices from each other, try: campfire --peer <their address> join)")
+            return tp.close()
+
+    roster = Roster(name, ident, Pins(CONFIG_DIR / "known.json") if ident else None)
+    tp.learned = roster.unicast_addrs
+    state = {"mute": False, "offers": [], "next": 1, "pending": {}}
+    fserver = FileServer()
+    temp_dirs = []
+    stop = threading.Event()
+    threading.Thread(target=listen, args=(tp, ident, room, name, host, roster, state, stop),
+                     daemon=True).start()
+    threading.Thread(target=keepalive, args=(tp, room, name, host, fserver, roster, stop),
+                     daemon=True).start()
+
+    def lookup(target):
+        """Find a person by name, explaining any problem. Returns the member or None."""
+        mem, problem = roster.find(target)
+        if problem == "none":
+            print(f"{DIM}Nobody named '{target.lstrip('@')}' is around the fire. Try /who.{RESET}")
+        elif problem:
+            print(f"{DIM}{problem}{RESET}")
+        return mem
+
+    def confirm_delivery(sent, ev, mem):
+        try:
+            for attempt in range(3):
+                if ev.wait(1.5):
+                    return
+                if attempt < 2:
+                    tp.transmit(sent.data, sent.dests)  # same message again; the receiver drops dupes
+            say(f"{RED}⚠{RESET} {DIM}Couldn't confirm that {roster.label(mem)} got your whisper. "
+                f"They may have left, or the network may be blocking direct messages.{RESET}")
+        finally:
+            state["pending"].pop(sent.mid, None)
+
+    def cmd_whisper(rest):
+        target, _, text = rest.strip().partition(" ")
+        target = target.lstrip("@")
+        text = text.strip()
+        if not target or not text:
+            print(f"{DIM}Usage: /whisper <n> <message>{RESET}")
+            return
+        if target.lower() == name.lower():
+            print(f"{DIM}You can't whisper to yourself.{RESET}")
+            return
+        mem = lookup(target)
+        if not mem:
+            return
+        if len(text) > TEXT_LIMIT:
+            text = text[:TEXT_LIMIT]
+            print(f"{DIM}(That's long for a whisper, so I cut it to {TEXT_LIMIT} characters.){RESET}")
+        extra, body, lock = {}, text, ""
+        if ident and mem["pk"]:
+            try:
+                extra = {"ct": b64e(ident.encrypt_for(mem["pk"], text.encode("utf-8")))}
+            except ValueError:
+                print(f"{DIM}I can't encrypt a whisper to {roster.label(mem)}, so I didn't send it.{RESET}")
+                return
+            body, lock = "", " 🔒"
+        elif ident:
+            print(f"{DIM}{roster.label(mem)} isn't in secure mode, so this whisper goes only to "
+                  f"them but isn't encrypted.{RESET}")
+        mid = secrets.token_hex(6)
+        ev = threading.Event()
+        if mem["ver"] >= 2:
+            state["pending"][mid] = (ev, mem["key"])  # register first: the ack can be very quick
+        sent = tp.send("whisper", room, name, body, dest=mem["addr"], to=mem["name"],
+                       tid=mem["sid"], mid=mid, **extra)
+        print(f"{DIM}{stamp()}{RESET} {MAGENTA}[whisper to{RESET} {roster.display(mem)}{MAGENTA}]{RESET}{lock} {text}")
+        if not sent.ok:
+            state["pending"].pop(mid, None)
+            print(f"{RED}⚠{RESET} {DIM}That didn't send: {tp.last_error}{RESET}")
+        elif mem["ver"] >= 2:
+            threading.Thread(target=confirm_delivery, args=(sent, ev, mem), daemon=True).start()
+
+    def cmd_send(rest):
+        path, to, use_picker = parse_send_args(rest)
+        target = None
+        if to:
+            target, problem = roster.find(to)
+            if not target:
+                if use_picker:
+                    print(f"{DIM}I couldn't find a file or a person called '{rest.strip()}'. "
+                          f"Tip: type /send by itself and pick the file from a window.{RESET}")
+                elif problem == "none":
+                    print(f"{DIM}Nobody named '{to}' is around the fire. Try /who.{RESET}")
+                else:
+                    print(f"{DIM}{problem}{RESET}")
+                return
+        if use_picker:
+            print(f"{DIM}A window is opening. Pick the file you want to share...{RESET}")
+            path, message = pick_file()
+            if not path:
+                print(f"{DIM}{message}{RESET}")
+                return
+        elif not path:
+            print(f"{DIM}I couldn't find that file. Tip: type /send by itself and pick it from a window.{RESET}")
+            return
+        if os.path.isdir(path):
+            print(f"{DIM}That's a folder, so I'm zipping it first...{RESET}")
+            try:
+                tmp = tempfile.mkdtemp(prefix="campfire-")
+                temp_dirs.append(tmp)
+                path = shutil.make_archive(os.path.join(tmp, safe_filename(path)), "zip",
+                                           root_dir=os.path.dirname(path),
+                                           base_dir=os.path.basename(path))
+            except (OSError, shutil.Error) as e:
+                print(f"{DIM}Couldn't zip that folder: {e}{RESET}")
+                return
+        try:
+            size = os.path.getsize(path)
+            fserver.start()
+        except OSError as e:
+            print(f"{DIM}Couldn't share that file: {e}{RESET}")
+            return
+        token = secrets.token_hex(8)
+        share = {"path": path, "filename": safe_filename(path), "size": size,
+                 "to": target["name"] if target else None,
+                 "to_key": target["key"] if target else None}
+        fserver.shares[token] = share
+        announce(tp, roster, room, name, token, share, fserver.port)
+        who = roster.display(target) if target else "the room"
+        print(f"{ORANGE}📎 Sharing{RESET} {BOLD}{share['filename']}{RESET} {DIM}({human_size(size)}){RESET} "
+              f"with {who}. {DIM}It stays available while you're in this room.{RESET}")
+
+    def cmd_files():
+        if not state["offers"]:
+            print(f"{DIM}Nobody is sharing anything right now.{RESET}")
+            return
+        for o in state["offers"]:
+            print(f"  {BOLD}{o['n']}{RESET}  {o['filename']}  {DIM}({human_size(o['size'])}){RESET}  from {cname(o['from'])}")
+        print(f"{DIM}Download with /get <number>{RESET}")
+
+    def cmd_get(rest):
+        arg = rest.strip()
+        if not arg.isdigit():
+            print(f"{DIM}Usage: /get <number>   (see /files for the list){RESET}")
+            return
+        offer = next((o for o in state["offers"] if o["n"] == int(arg)), None)
+        if not offer:
+            print(f"{DIM}There's no shared file #{arg}. Try /files.{RESET}")
+            return
+        print(f"{DIM}Downloading {offer['filename']}...{RESET}")
+        threading.Thread(target=download_in_background, args=(offer,), daemon=True).start()
+
+    def cmd_id(rest):
+        target = rest.strip()
+        if not target:
+            if ident:
+                print(f"{DIM}Your fingerprint:{RESET} {BOLD}{fmt_fp(ident.fp)}{RESET}  "
+                      f"{DIM}(read it out to a friend so they can check it's really you){RESET}")
+            return
+        mem = lookup(target)
+        if mem:
+            if mem["fp"]:
+                print(f"{roster.display(mem)}{DIM}'s fingerprint:{RESET} {BOLD}{fmt_fp(mem['fp'])}{RESET}")
+            else:
+                print(f"{DIM}{roster.label(mem)} isn't in secure mode, so there's no fingerprint to check.{RESET}")
+
+    def cmd_trust(rest):
+        target = rest.strip()
+        if not target:
+            print(f"{DIM}Usage: /trust <n>   (only after you've checked with them that it's really them){RESET}")
+            return
+        mem = lookup(target)
+        if not mem:
+            return
+        if not mem["pk"]:
+            print(f"{DIM}{roster.label(mem)} isn't in secure mode, so there's no identity to trust.{RESET}")
+            return
+        roster.trust(mem)
+        print(f"{DIM}OK. From now on, '{mem['name']}' means this one ({fmt_fp(mem['fp'])}).{RESET}")
+
+    def cmd_peer(rest):
+        addr = parse_peer(rest) if rest.strip() else None
+        if not addr:
+            print(f"{DIM}Usage: /peer <address>   (like 192.168.1.20 or their-mac.local){RESET}")
+            return
+        if addr not in tp.peers:
+            tp.peers.append(addr)
+        tp.send("hello", room, name, dest=addr)
+        print(f"{DIM}Reaching out to {addr[0]}. If someone's there, they'll show up in /who.{RESET}")
+
+    def cmd_net():
+        print(f"{DIM}How campfire is reaching people:{RESET}")
+        if tp.ifaces:
+            for ifname, ip, bcast in tp.ifaces:
+                print(f"  {BOLD}{ifname}{RESET}  {ip}  {DIM}broadcast {bcast or '255.255.255.255'}{RESET}")
+        else:
+            print(f"  {DIM}I couldn't detect your network, so I'm using the general broadcast address.{RESET}")
+        direct = len(set(roster.unicast_addrs()))
+        print(f"  {DIM}Sending directly to {direct} {'person' if direct == 1 else 'people'}"
+              f"{f', plus {len(tp.peers)} added by hand' if tp.peers else ''}.{RESET}")
+        print(f"  {DIM}Secure mode: {'on' if ident else 'off'}{RESET}")
+        if tp.last_error:
+            print(f"  {RED}Last network error: {tp.last_error}{RESET}")
+
+    print(banner())
+    verb = "lit" if host else "joined"
+    print(f"{ORANGE}🔥 You {verb} '{room}' as{RESET} {cname(name)}{ORANGE}.{RESET} {DIM}Type /help for commands.{RESET}")
+    print(f"{DIM}🔒 Names are verified and whispers are encrypted. "
+          f"Your fingerprint is {fmt_fp(ident.fp)}.{RESET}")
+    tp.send("hello", room, name)  # also goes straight to anyone added with --peer
+
+    try:
+        while True:
+            try:
+                line = input("> ").strip()
+            except EOFError:
+                break
+            if not line:
+                continue
+
+            command = as_command(line)
+            if command is not None:
+                # Anything that looks like a / command is for you alone. Every branch below
+                # ends in `continue`, so a command can never fall through and be sent as a spark.
+                cmd, _, rest = command.partition(" ")
+                cmd = cmd.lower()
+
+                if cmd in ("/quit", "/q", "/leave"):
+                    break
+                elif cmd == "/help":
+                    show_help()
+                elif cmd == "/who":
+                    everyone = [cname(name) + DIM + " (you)" + RESET] + [roster.display(x) for x in roster.people()]
+                    print(f"{DIM}Around the fire ({len(everyone)}):{RESET} " + ", ".join(everyone))
+                elif cmd in ("/whisper", "/w", "/msg"):
+                    cmd_whisper(rest)
+                elif cmd == "/send":
+                    cmd_send(rest)
+                elif cmd == "/files":
+                    cmd_files()
+                elif cmd == "/get":
+                    cmd_get(rest)
+                elif cmd == "/id":
+                    cmd_id(rest)
+                elif cmd == "/trust":
+                    cmd_trust(rest)
+                elif cmd == "/peer":
+                    cmd_peer(rest)
+                elif cmd == "/net":
+                    cmd_net()
+                elif cmd == "/version":
+                    print(f"{ORANGE}🔥 campfire{RESET} {BOLD}v{VERSION}{RESET}  "
+                          f"{DIM}(to update: leave the room and type: campfire update){RESET}")
+                elif cmd == "/mute":
+                    state["mute"] = True
+                    print(f"{DIM}Notifications off. (@mentions of you still come through.){RESET}")
+                elif cmd == "/unmute":
+                    state["mute"] = False
+                    print(f"{DIM}Notifications on.{RESET}")
+                else:
+                    print(f"{DIM}Unknown command '{cmd}'. Type /help to see what's available.{RESET}")
+                continue
+
+            pieces = chunk_text(line)
+            for i, piece in enumerate(pieces):
+                men, problems = roster.mentions(piece)
+                sent = tp.send("spark", room, name, piece, **({"men": men} if men else {}))
+                for problem in dict.fromkeys(problems):
+                    print(f"{DIM}{problem}{RESET}")
+                if not sent.ok:
+                    print(f"{RED}⚠{RESET} {DIM}That didn't send: {tp.last_error}{RESET}")
+                    break
+                if i < len(pieces) - 1:
+                    time.sleep(0.05)  # keep long messages in order
+    except KeyboardInterrupt:
+        print()
+    finally:
+        tp.send("bye", room, name)
+        stop.set()
+        fserver.close()
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        tp.close()
+        print(f"{DIM}You left the fire. 🌙{RESET}")
+
+
+def list_fires(peers=()):
+    tp = open_transport(None, peers)
+    if tp is None:
+        return
+    print("Looking for fires nearby...")
+    fires = find_fires(tp, 3.0)
+    tp.close()
+    print(f"{ORANGE}  {GLOBAL}{RESET}  (always burning)")
+    for room, host in sorted(fires.items()):
+        print(f"{ORANGE}  {room}{RESET}  lit by {cname(host)}")
+    if not fires:
+        print(f"{DIM}  No other fires. Start one with: campfire light <room>{RESET}")
+
+
+def main():
+    args = sys.argv[1:]
+    name = os.environ.get("CAMPFIRE_NAME") or getpass.getuser()
+
+    if "--name" in args:
+        i = args.index("--name")
+        if i + 1 >= len(args):
+            print("--name needs a value, like: campfire --name Sam join")
+            return
+        name = args[i + 1]
+        del args[i:i + 2]
+
+    wanted = os.environ.get("CAMPFIRE_PEERS", "").replace(",", " ").split()
+    while "--peer" in args:
+        i = args.index("--peer")
+        if i + 1 >= len(args):
+            print("--peer needs an address, like: campfire --peer 192.168.1.20 join")
+            return
+        wanted.append(args[i + 1])
+        del args[i:i + 2]
+    peers = []
+    for text in wanted:
+        addr = parse_peer(text)
+        if not addr:
+            print(f"I couldn't find '{text}'. Use an address like 192.168.1.20 or their-mac.local")
+            return
+        peers.append(addr)
+
+    name = clean(name.strip(), 24) or "stranger"
+
+    if args and args[0] in ("version", "--version", "-v"):
+        print(f"campfire v{VERSION}")
+        return
+
+    if args and args[0] in ("rm", "uninstall", "remove"):
+        run_remove(assume_yes=("-y" in args or "--yes" in args))
+        return
+
+    if args and args[0] == "update":
+        run_update(check_only="--check" in args)
+        return
+
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(banner())
+        print(__doc__)
+        return
+
+    cmd = args[0]
+    room = clean(args[1].lower(), 40) if len(args) > 1 else None
+
+    if cmd == "join":
+        chat(room or GLOBAL, name, peers=peers)
+    elif cmd == "light":
+        if not room:
+            print("Give your fire a name, like: campfire light movie-night")
+            return
+        chat(room, name, host=True, peers=peers)
+    elif cmd == "list":
+        list_fires(peers)
+    else:
+        print(f"Unknown command '{cmd}'.")
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
